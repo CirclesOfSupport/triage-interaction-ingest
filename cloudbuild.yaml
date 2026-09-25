@@ -1,0 +1,26 @@
+# Env vars, memory, and request timeout are set on the Cloud Run revision
+# (gcloud run services update --update-env-vars), NOT here. The continuous-deploy
+# trigger created through the console builds from the Dockerfile and does not
+# read deploy flags from this file.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/triage-interaction-ingest:$COMMIT_SHA
+      - .
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/triage-interaction-ingest:$COMMIT_SHA
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - triage-interaction-ingest
+      - --image=us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/triage-interaction-ingest:$COMMIT_SHA
+      - --region=us-east1
+      - --no-allow-unauthenticated
+images:
+  - us-east1-docker.pkg.dev/$PROJECT_ID/webhook-repo/triage-interaction-ingest:$COMMIT_SHA
