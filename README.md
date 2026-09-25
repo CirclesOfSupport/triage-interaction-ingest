@@ -86,10 +86,12 @@ The runtime service account needs BigQuery Data Editor and BigQuery Job User on
 
 ## Deploy
 
-A Cloud Build trigger (`triage-interaction-ingest`, global) runs `cloudbuild.yaml` on every
-push to `main`: build, push to Artifact Registry
+A Cloud Build trigger (`triage-interaction-ingest`, global, running as the compute service
+account) runs `cloudbuild.yaml` on every push to `main`: build, push to Artifact Registry
 `cloud-run-source-deploy/triage-interaction-ingest`, and `gcloud run deploy` in us-east1
-with `--no-allow-unauthenticated`.
+with `--no-allow-unauthenticated`. The deploy stamps the continuous-deployment labels
+(`managed-by`, `commit-sha`, `gcb-build-id`, `gcb-trigger-id`, `gcb-trigger-region`); the
+trigger carries its own id as the `_TRIGGER_ID` substitution for that.
 
 ## Tests
 
