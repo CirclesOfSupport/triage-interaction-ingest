@@ -86,12 +86,12 @@ The runtime service account needs BigQuery Data Editor and BigQuery Job User on
 
 ## Deploy
 
-A Cloud Build trigger (`triage-interaction-ingest`, global, running as the compute service
-account) runs `cloudbuild.yaml` on every push to `main`: build, push to Artifact Registry
-`cloud-run-source-deploy/triage-interaction-ingest`, and `gcloud run deploy` in us-east1
-with `--no-allow-unauthenticated`. The deploy stamps the continuous-deployment labels
-(`managed-by`, `commit-sha`, `gcb-build-id`, `gcb-trigger-id`, `gcb-trigger-region`); the
-trigger carries its own id as the `_TRIGGER_ID` substitution for that.
+Continuous deployment from this repository: the service was created with the Cloud Run
+"Connect repository" flow, which made a Cloud Build trigger on `main` that builds the
+`Dockerfile`, pushes the image to Artifact Registry and deploys a new revision. That trigger
+runs its own inline build config; `cloudbuild.yaml` here is not what it runs. Env vars live on
+the Cloud Run revision (`gcloud run services update --update-env-vars`) and carry over from
+revision to revision.
 
 ## Tests
 
