@@ -84,6 +84,13 @@ request query string, so no error message this service raises includes a request
 The runtime service account needs BigQuery Data Editor and BigQuery Job User on
 `early-alert-responses`.
 
+## Deploy
+
+A Cloud Build trigger (`triage-interaction-ingest`, global) runs `cloudbuild.yaml` on every
+push to `main`: build, push to Artifact Registry
+`cloud-run-source-deploy/triage-interaction-ingest`, and `gcloud run deploy` in us-east1
+with `--no-allow-unauthenticated`.
+
 ## Tests
 
 ```
