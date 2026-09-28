@@ -13,6 +13,8 @@ Question IDs on the Interaction Log survey (6902806):
   134  suicide risk assessment result
   131  wellness check initiated
   130  active rescue initiated
+  140  warm hand-off to the Veteran Crisis Line (radio Yes/No; shown only for a veteran
+       subscriber with a moderate or high determination, from 2026-08-29 — blank otherwise)
 
 Collapse rule: one row per trid, keeping the LATEST submission (by date_submitted).
 Conclude rule (team decision 2026-06-23): concluded_datetime is null whenever the
@@ -26,7 +28,7 @@ from normalizer import normalize
 
 JUNK_TRIDS = ("testid", "demo", "test")
 
-# The ten columns the MERGE reads, in the order of the original staging CSV.
+# The eleven columns the MERGE reads: the original staging CSV's ten, then 140.
 MERGE_COLUMNS = [
     "triage_request_id",
     "triage_interaction_type",
@@ -38,6 +40,7 @@ MERGE_COLUMNS = [
     "triage_interaction_suicide_risk_assessment_result",
     "triage_interaction_wellness_check_initiated",
     "triage_interaction_active_rescue_initiated",
+    "triage_interaction_vcl_warm_handoff",
 ]
 
 # Provenance columns: which Alchemer response each row came from. Not read by the MERGE;
@@ -130,12 +133,14 @@ def build_staging(responses):
             "triage_interaction_suicide_risk_assessment_result": ans(sd, "134"),
             "triage_interaction_wellness_check_initiated": ans(sd, "131"),
             "triage_interaction_active_rescue_initiated": ans(sd, "130"),
+            "triage_interaction_vcl_warm_handoff": ans(sd, "140"),
             "source_response_id": str(r.get("id")) if r.get("id") is not None else None,
             "source_date_submitted": sub or None,
             "source_status": r.get("status"),
         })
 
     conn = Counter(row["triage_interaction_connected"] for row in rows)
+    vcl = Counter(row["triage_interaction_vcl_warm_handoff"] for row in rows)
     stats = {
         "responses": len(responses),
         "staging_rows": len(rows),
@@ -144,6 +149,9 @@ def build_staging(responses):
         "connected_yes": conn.get("Yes", 0),
         "connected_no": conn.get("No", 0),
         "connected_null": conn.get(None, 0),
+        "vcl_warm_handoff_yes": vcl.get("Yes", 0),
+        "vcl_warm_handoff_no": vcl.get("No", 0),
+        "vcl_warm_handoff_null": vcl.get(None, 0),
         "initiated_null": sum(1 for row in rows if not row["triage_interaction_initiated_datetime"]),
         "source_status_counts": dict(Counter(row["source_status"] for row in rows)),
     }

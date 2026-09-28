@@ -37,17 +37,18 @@ SAMPLE = [
          q131="No", q130="No"),
     # T1 resubmitted later: the later one must win
     resp(2, "T1", "2026-09-02 09:00:00 EDT", q136="Follow-Up", q119="1900",
-         q135="did not respond", q126="9/2 8pm", q128=["Text"]),
+         q135="did not respond", q126="9/2 8pm", q128=["Text"], q140="No"),
     # Earlier duplicate arriving after the later one in list order: must NOT win
     resp(3, "T2", "2026-09-03 12:00:00 EDT", q136="Initial Contact", q119="843",
          q135="", q120="10.11.2023 12:00am"),
-    resp(4, "T2", "2026-09-03 11:00:00 EDT", q136="STALE", q119="1:00"),
+    # Stale T2 answered 140; the later T2 submission (140 hidden) wins, so it lands null
+    resp(4, "T2", "2026-09-03 11:00:00 EDT", q136="STALE", q119="1:00", q140="Yes"),
     resp(5, "testID", "2026-09-04 12:00:00 EDT", q119="1:00"),
     resp(6, None, "2026-09-04 12:00:00 EDT", q119="1:00"),
     resp(7, "  ", "2026-09-04 12:00:00 EDT", q119="1:00"),
     resp(8, " T3 ", "2026-09-05 08:00:00 EDT", status="Partial", q119="5:32 pm (EST)",
          q135="n/a"),
-    resp(9, "T4", "2026-09-06 08:00:00 EDT", q119="garbage text", q135="maybe"),
+    resp(9, "T4", "2026-09-06 08:00:00 EDT", q119="garbage text", q135="maybe", q140="Yes"),
 ]
 
 
@@ -71,6 +72,18 @@ def test_collapse_and_rules():
     assert by["T3"]["source_status"] == "Partial"
     assert by["T3"]["triage_interaction_initiated_datetime"] == "2026-09-05T17:32:00"
     assert stats["source_status_counts"] == {"Complete": 3, "Partial": 1}
+    # question 140: taken from the winning submission; null when hidden
+    assert by["T1"]["triage_interaction_vcl_warm_handoff"] == "No"
+    assert by["T2"]["triage_interaction_vcl_warm_handoff"] is None
+    assert by["T3"]["triage_interaction_vcl_warm_handoff"] is None
+    assert by["T4"]["triage_interaction_vcl_warm_handoff"] == "Yes"
+    assert (stats["vcl_warm_handoff_yes"], stats["vcl_warm_handoff_no"],
+            stats["vcl_warm_handoff_null"]) == (1, 1, 2)
+
+
+def test_merge_columns_include_140():
+    assert staging.MERGE_COLUMNS[-1] == "triage_interaction_vcl_warm_handoff"
+    assert len(staging.MERGE_COLUMNS) == 11
 
 
 def test_parity_with_manual_builder():
@@ -189,7 +202,7 @@ def _patch_pipeline(monkeypatch, staging_row, match_row, target_row=None):
 
 
 GOOD_STAGING = {"total_rows": 4, "distinct_trids": 4, "null_or_blank_trid": 0,
-                "connected_unexpected": 0, "no_with_conclude": 0}
+                "connected_unexpected": 0, "no_with_conclude": 0, "vcl_unexpected": 0}
 GOOD_MATCH = {"distinct_trids_in_staging": 4, "matched_trids": 3, "unmatched_trids": 1,
               "distinct_target_message_ids": 3}
 GOOD_TARGET = {"rows_with_interaction_data": 5, "distinct_message_ids_with_data": 3,
@@ -208,7 +221,8 @@ def test_dry_run_skips_merge(monkeypatch):
     assert r["status"] == "ok" and not merged["called"] and r["rows_modified"] is None
 
 
-@pytest.mark.parametrize("field", ["null_or_blank_trid", "connected_unexpected", "no_with_conclude"])
+@pytest.mark.parametrize("field", ["null_or_blank_trid", "connected_unexpected", "no_with_conclude",
+                                   "vcl_unexpected"])
 def test_staging_gate_blocks_merge(monkeypatch, field):
     bad = dict(GOOD_STAGING, **{field: 1})
     merged = _patch_pipeline(monkeypatch, bad, GOOD_MATCH, GOOD_TARGET)

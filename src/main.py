@@ -4,7 +4,7 @@ Nightly refresh of the counselor interaction log into BigQuery.
 
 Counselors record each triage interaction in the Alchemer Interaction Log survey. This
 service pulls every response, builds one staging row per triage_request_id (see
-staging.py), loads the rows into a staging table, checks them, and MERGEs the nine
+staging.py), loads the rows into a staging table, checks them, and MERGEs the ten
 triage_interaction_* columns onto the matching row of `triage-message-data`.
 
 It replaces a four-step on-demand refresh (export, rebuild staging CSV, load, MERGE)
@@ -200,13 +200,15 @@ def check_staging():
           COUNTIF(triage_interaction_connected IS NOT NULL
                   AND triage_interaction_connected NOT IN ('Yes', 'No')) AS connected_unexpected,
           COUNTIF(triage_interaction_connected = 'No'
-                  AND triage_interaction_concluded_datetime IS NOT NULL) AS no_with_conclude
+                  AND triage_interaction_concluded_datetime IS NOT NULL) AS no_with_conclude,
+          COUNTIF(triage_interaction_vcl_warm_handoff IS NOT NULL
+                  AND triage_interaction_vcl_warm_handoff NOT IN ('Yes', 'No')) AS vcl_unexpected
         FROM `{STAGING_TABLE}`
     """)[0]
     out = dict(r.items())
     if out["total_rows"] != out["distinct_trids"]:
         raise GateFailure("staging_check", f"{out['total_rows']} rows but {out['distinct_trids']} distinct trids")
-    for k in ("null_or_blank_trid", "connected_unexpected", "no_with_conclude"):
+    for k in ("null_or_blank_trid", "connected_unexpected", "no_with_conclude", "vcl_unexpected"):
         if out[k] != 0:
             raise GateFailure("staging_check", f"{k} = {out[k]}")
     return out

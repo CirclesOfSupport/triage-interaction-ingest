@@ -4,9 +4,9 @@ Cloud Run service that brings the counselor interaction log into BigQuery every 
 (ITDO-397).
 
 Our counselors record each triage interaction in the Alchemer **Interaction Log** survey
-(6902806): who reached out, when, whether the individual responded, how, and the risk and
-rescue outcomes. This service pulls every response, builds one row per
-`triage_request_id`, and writes the nine `triage_interaction_*` columns onto the matching
+(6902806): who reached out, when, whether the individual responded, how, the risk and
+rescue outcomes, and whether a veteran was given a warm hand-off to the Veteran Crisis Line. This service pulls every response, builds one row per
+`triage_request_id`, and writes the ten `triage_interaction_*` columns onto the matching
 message row in `RESPONSES.triage-message-data`.
 
 It runs as a step in `nightly-pipeline`. It replaces a four-step refresh we used to run by
@@ -26,14 +26,17 @@ hand (export, rebuild a staging CSV, load it, MERGE); the rules are unchanged.
    - "did the individual respond" comes from question 135, falling back to the deprecated
      question 120; a non-time answer ("did not respond") means `No`;
    - the concluded datetime is nulled whenever the individual did not respond — we decided
-     on 2026-06-23 that conclude is only meaningful after a response.
+     on 2026-06-23 that conclude is only meaningful after a response;
+   - the Veteran Crisis Line warm hand-off (`triage_interaction_vcl_warm_handoff`, `Yes`/`No`)
+     comes from question 140, which the survey shows only for a veteran with a moderate or
+     high determination (from 2026-08-29); it is null everywhere else.
 3. **Load** the rows into `OPS.triage_interaction_staging` (replaced every run), plus
    three provenance columns (`source_response_id`, `source_date_submitted`,
    `source_status`) and `loaded_at`, and confirm the table holds exactly the rows built.
 4. **Check** before writing anything:
-   - the nine `triage_interaction_*` columns exist on the target as STRING;
-   - staging has one row per trid, no blank trid, `connected` only `Yes`/`No`/null, and no
-     `No` row carrying a conclude;
+   - the ten `triage_interaction_*` columns exist on the target as STRING;
+   - staging has one row per trid, no blank trid, `connected` and the warm hand-off only
+     `Yes`/`No`/null, and no `No` row carrying a conclude;
    - matched trids equal the distinct target `message_id`s they map to (no two trids land
      on one message).
 5. **MERGE** onto `triage-message-data`, keyed on `message_id`. When a trid has several
