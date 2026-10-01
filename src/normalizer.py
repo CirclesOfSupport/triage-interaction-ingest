@@ -1,4 +1,8 @@
 import re
+from datetime import date
+
+# extract_date's marker for a month/day/year that is not a real calendar date (e.g. 2/30/26).
+INVALID_DATE = 'invalid_date'
 
 def extract_date(s, fallback_year):
     m = re.search(r'\b(\d{1,2})\s*[/.]\s*(\d{1,2})(?:\s*[/.]\s*(\d{2,4}))?\b', s)
@@ -11,6 +15,12 @@ def extract_date(s, fallback_year):
     if not (yr and 1<=mo<=12 and 1<=da<=31):
         return None, s
     remainder = s[:m.start()] + ' ' + s[m.end():]
+    try:
+        date(yr, mo, da)
+    except ValueError:
+        # in range field by field but not a real date (2/30, 4/31, 2/29 off a leap year):
+        # reported as invalid_date with no value, never guessed and never passed on as text
+        return INVALID_DATE, remainder
     return f"{yr:04d}-{mo:02d}-{da:02d}", remainder
 
 def extract_time(s):
@@ -60,6 +70,7 @@ def normalize(v, resp_date):
     s2=re.sub(r'\(.*?\)',' ',s).strip()
     fy=int(resp_date[:4]) if resp_date else None
     date_iso, remainder = extract_date(s2, fy)
+    if date_iso == INVALID_DATE: return (None,'invalid_date')
     time_src = remainder if date_iso else s2
     time_iso = extract_time(time_src)
     if date_iso and time_iso: return (f"{date_iso}T{time_iso}",'full_parse')

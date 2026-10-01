@@ -14,12 +14,17 @@ Endpoints
   GET  /health  -> {"status": "ok"}
   POST /run     -> full refresh.       Body {}
   POST /run     -> checks, no MERGE.   Body {"dry_run": true}
+  POST /run     -> the same checks against a DEV copy of the target.
+                   Body {"dry_run": true, "target_table": "early-alert-responses.DEV.<table>"}
 
 Auth is the Cloud Run layer only (--no-allow-unauthenticated; callers need
 roles/run.invoker). The body is not checked for a password.
 
 Every run stops before the MERGE if any check fails, and returns status "error" with
 HTTP 500 naming the failed check, so a caller (and the request log) sees the failure.
+One exception: a counselor-typed date that is not a real calendar date (2/30) does not stop
+the night. That datetime is written as null, the MERGE runs for everyone, and the run then
+returns status "error" (failed_check "invalid_dates") naming each message_id affected.
 """
 
 import json
@@ -53,6 +58,32 @@ TARGET_TABLE = os.environ.get(
     "TARGET_TABLE", "early-alert-responses.RESPONSES.triage-message-data")
 
 MERGE_MAX_RETRIES = 3
+
+# A dry run may be pointed at a copy of the target, never at another live table.
+DRY_RUN_TARGET_PREFIX = "early-alert-responses.DEV."
+
+# Types the target may give each MERGE column. Staging is always STRING; the MERGE converts
+# to whatever the target column is. Each column is read separately, so a target part-way
+# through a type change (some columns converted, some not) still merges correctly.
+DATETIME_COLUMNS = (
+    "triage_interaction_initiated_datetime",
+    "triage_interaction_connected_datetime",
+    "triage_interaction_concluded_datetime",
+)
+BOOL_COLUMNS = (
+    "triage_interaction_connected",
+    "triage_interaction_wellness_check_initiated",
+    "triage_interaction_active_rescue_initiated",
+    "triage_interaction_vcl_warm_handoff",
+)
+
+
+def allowed_types(column):
+    if column in DATETIME_COLUMNS:
+        return ("STRING", "DATETIME")
+    if column in BOOL_COLUMNS:
+        return ("STRING", "BOOL")
+    return ("STRING",)
 
 
 class GateFailure(Exception):
@@ -172,8 +203,11 @@ def load_staging(rows, run_ts):
     return loaded
 
 
-def check_target_columns():
-    project, dataset, table = TARGET_TABLE.split(".")
+def check_target_columns(target=None):
+    """Return {column: type} for the MERGE columns on the target; fail if any is missing or
+    has a type the MERGE cannot write."""
+    target = target or TARGET_TABLE
+    project, dataset, table = target.split(".")
     rows = q(f"""
         SELECT column_name, data_type
         FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
@@ -186,12 +220,18 @@ def check_target_columns():
                if c not in have]
     if missing:
         raise GateFailure("target_columns", f"missing on target: {', '.join(missing)}")
-    not_string = [c for c in MERGE_COLUMNS[1:] if have[c] != "STRING"]
-    if not_string:
-        raise GateFailure("target_columns", f"not STRING on target: {', '.join(not_string)}")
+    wrong = [f"{c} is {have[c]} (allowed: {'/'.join(allowed_types(c))})"
+             for c in MERGE_COLUMNS[1:] if have[c] not in allowed_types(c)]
+    if wrong:
+        raise GateFailure("target_columns", f"unexpected type on target: {'; '.join(wrong)}")
+    return {c: have[c] for c in MERGE_COLUMNS[1:]}
 
 
-def check_staging():
+def check_staging(types=None):
+    """Staging (always STRING) must be writable to the target as it is typed now. The
+    Yes/No and datetime-shape counts are always reported; a count only fails the run when
+    the target column it protects is typed (a STRING target stores the text as it is)."""
+    types = types or {c: "STRING" for c in MERGE_COLUMNS[1:]}
     r = q(f"""
         SELECT
           COUNT(*) AS total_rows,
@@ -202,7 +242,17 @@ def check_staging():
           COUNTIF(triage_interaction_connected = 'No'
                   AND triage_interaction_concluded_datetime IS NOT NULL) AS no_with_conclude,
           COUNTIF(triage_interaction_vcl_warm_handoff IS NOT NULL
-                  AND triage_interaction_vcl_warm_handoff NOT IN ('Yes', 'No')) AS vcl_unexpected
+                  AND triage_interaction_vcl_warm_handoff NOT IN ('Yes', 'No')) AS vcl_unexpected,
+          COUNTIF(triage_interaction_wellness_check_initiated IS NOT NULL
+                  AND triage_interaction_wellness_check_initiated NOT IN ('Yes', 'No')) AS wellness_unexpected,
+          COUNTIF(triage_interaction_active_rescue_initiated IS NOT NULL
+                  AND triage_interaction_active_rescue_initiated NOT IN ('Yes', 'No')) AS rescue_unexpected,
+          COUNTIF(triage_interaction_initiated_datetime IS NOT NULL
+                  AND SAFE_CAST(triage_interaction_initiated_datetime AS DATETIME) IS NULL) AS initiated_not_datetime,
+          COUNTIF(triage_interaction_connected_datetime IS NOT NULL
+                  AND SAFE_CAST(triage_interaction_connected_datetime AS DATETIME) IS NULL) AS connected_not_datetime,
+          COUNTIF(triage_interaction_concluded_datetime IS NOT NULL
+                  AND SAFE_CAST(triage_interaction_concluded_datetime AS DATETIME) IS NULL) AS concluded_not_datetime
         FROM `{STAGING_TABLE}`
     """)[0]
     out = dict(r.items())
@@ -211,6 +261,16 @@ def check_staging():
     for k in ("null_or_blank_trid", "connected_unexpected", "no_with_conclude", "vcl_unexpected"):
         if out[k] != 0:
             raise GateFailure("staging_check", f"{k} = {out[k]}")
+    typed_gates = (
+        ("triage_interaction_wellness_check_initiated", "wellness_unexpected"),
+        ("triage_interaction_active_rescue_initiated", "rescue_unexpected"),
+        ("triage_interaction_initiated_datetime", "initiated_not_datetime"),
+        ("triage_interaction_connected_datetime", "connected_not_datetime"),
+        ("triage_interaction_concluded_datetime", "concluded_not_datetime"),
+    )
+    for column, k in typed_gates:
+        if types.get(column, "STRING") != "STRING" and out[k] != 0:
+            raise GateFailure("staging_check", f"{k} = {out[k]} (target {column} is {types[column]})")
     return out
 
 
@@ -227,8 +287,8 @@ _MSG_EARLIEST = """
 """
 
 
-def match_counts():
-    msg = _MSG_EARLIEST.format(target=TARGET_TABLE)
+def match_counts(target=None):
+    msg = _MSG_EARLIEST.format(target=target or TARGET_TABLE)
     r = q(f"""
         WITH msg AS ({msg})
         SELECT
@@ -248,13 +308,25 @@ def match_counts():
     return out
 
 
-def run_merge():
-    msg = _MSG_EARLIEST.format(target=TARGET_TABLE)
+def source_expr(column, target_type):
+    """How the MERGE source reads a staging column for a target column of target_type."""
+    if target_type == "DATETIME":
+        return f"CAST(s.{column} AS DATETIME) AS {column}"
+    if target_type == "BOOL":
+        # Yes/No only (check_staging); anything else would already have stopped the run.
+        return f"CASE s.{column} WHEN 'Yes' THEN TRUE WHEN 'No' THEN FALSE END AS {column}"
+    return f"s.{column}"
+
+
+def merge_sql(types=None, target=None):
+    target = target or TARGET_TABLE
+    types = types or {c: "STRING" for c in MERGE_COLUMNS[1:]}
+    msg = _MSG_EARLIEST.format(target=target)
     cols = MERGE_COLUMNS[1:]
-    select_cols = ",\n      ".join(f"s.{c}" for c in cols)
+    select_cols = ",\n      ".join(source_expr(c, types[c]) for c in cols)
     set_cols = ",\n      ".join(f"T.{c} = U.{c}" for c in cols)
-    sql = f"""
-MERGE `{TARGET_TABLE}` AS T
+    return f"""
+MERGE `{target}` AS T
 USING (
   SELECT
       m.message_id,
@@ -268,6 +340,19 @@ ON T.message_id = U.message_id
 WHEN MATCHED THEN UPDATE SET
       {set_cols}
 """
+
+
+def validate_sql(sql, gate):
+    """BigQuery dry run: compiles the statement against the live schemas, writes nothing."""
+    try:
+        bq().query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
+    except gexc.GoogleAPICallError as e:
+        raise GateFailure(gate, f"BigQuery rejected the statement: {str(e)[:400]}")
+    return True
+
+
+def run_merge(types=None):
+    sql = merge_sql(types)
     for attempt in range(1, MERGE_MAX_RETRIES + 1):
         try:
             job = bq().query(sql)
@@ -283,8 +368,37 @@ WHEN MATCHED THEN UPDATE SET
             raise
 
 
-def verify_target():
-    r = q(f"""
+def invalid_date_report(target=None):
+    """Staging rows whose counselor-typed date is not a real calendar date. Their datetime was
+    written as null (the rest of the row as usual). Matched ones are named by message_id."""
+    msg = _MSG_EARLIEST.format(target=target or TARGET_TABLE)
+    rows = q(f"""
+        WITH msg AS ({msg})
+        SELECT s.triage_request_id, m.message_id, s.invalid_date_columns,
+               s.source_initiated_raw, s.source_connected_raw, s.source_concluded_raw
+        FROM `{STAGING_TABLE}` AS s
+        LEFT JOIN msg AS m
+          ON m.triage_request_id = s.triage_request_id AND m.rn = 1
+        WHERE s.invalid_date_columns IS NOT NULL
+        ORDER BY m.message_id, s.triage_request_id
+    """)
+    out = {"messages": [], "unmatched_trids": []}
+    for r in rows:
+        r = dict(r.items())
+        if r["message_id"] is None:
+            out["unmatched_trids"].append(r["triage_request_id"])
+        else:
+            out["messages"].append({k: r[k] for k in (
+                "message_id", "triage_request_id", "invalid_date_columns", "source_initiated_raw",
+                "source_connected_raw", "source_concluded_raw")})
+    return out
+
+
+def verify_sql(types=None, target=None):
+    target = target or TARGET_TABLE
+    types = types or {c: "STRING" for c in MERGE_COLUMNS[1:]}
+    no = "FALSE" if types["triage_interaction_connected"] == "BOOL" else "'No'"
+    return f"""
         SELECT
           COUNTIF(triage_interaction_initiated_datetime IS NOT NULL
                   OR triage_interaction_connected IS NOT NULL
@@ -292,11 +406,15 @@ def verify_target():
           COUNT(DISTINCT IF(triage_interaction_initiated_datetime IS NOT NULL
                   OR triage_interaction_connected IS NOT NULL
                   OR triage_interaction_method IS NOT NULL, message_id, NULL)) AS distinct_message_ids_with_data,
-          COUNTIF(triage_interaction_connected = 'No'
+          COUNTIF(triage_interaction_connected = {no}
                   AND triage_interaction_concluded_datetime IS NOT NULL) AS no_with_conclude,
           MAX(triage_interaction_initiated_datetime) AS latest_initiated_datetime
-        FROM `{TARGET_TABLE}`
-    """)[0]
+        FROM `{target}`
+    """
+
+
+def verify_target(types=None, target=None):
+    r = q(verify_sql(types, target))[0]
     out = dict(r.items())
     if out["no_with_conclude"] != 0:
         raise GateFailure("target_check", f"no_with_conclude = {out['no_with_conclude']}")
@@ -307,24 +425,44 @@ def verify_target():
 # Run
 # ---------------------------------------------------------------------------
 
-def run_refresh(dry_run=False):
+def run_refresh(dry_run=False, target_table=None):
     run_ts = datetime.now(timezone.utc).isoformat()
     result = {"status": "ok", "mode": "dry_run" if dry_run else "merge", "run_at": run_ts}
     started = time.time()
     try:
+        if target_table is not None:
+            if not dry_run:
+                raise GateFailure("config", "target_table is accepted only with dry_run")
+            if not str(target_table).startswith(DRY_RUN_TARGET_PREFIX):
+                raise GateFailure("config", f"target_table must be in {DRY_RUN_TARGET_PREFIX}")
+            result["target_table"] = target_table
+        target = target_table or TARGET_TABLE
         responses, total_count = pull_all_responses()
         result["alchemer_total_count"] = total_count
         rows, stats = build_staging(responses)
         result.update(stats)
-        check_target_columns()
+        types = check_target_columns(target)
+        result["target_types"] = types
         result["staging_loaded"] = load_staging(rows, run_ts)
-        result["staging_check"] = check_staging()
-        result["match"] = match_counts()
+        result["staging_check"] = check_staging(types)
+        result["match"] = match_counts(target)
         if dry_run:
             result["rows_modified"] = None
+            result["merge_validated"] = validate_sql(merge_sql(types, target), "merge_validation")
+            result["target"] = verify_target(types, target)
+            result["invalid_dates"] = invalid_date_report(target)
         else:
-            result["rows_modified"] = run_merge()
-            result["target"] = verify_target()
+            result["rows_modified"] = run_merge(types)
+            result["target"] = verify_target(types)
+            result["invalid_dates"] = invalid = invalid_date_report()
+            if invalid["messages"]:
+                # Everyone else's data is already written; this makes the night's alert fire
+                # for the entries a counselor needs to correct.
+                named = "; ".join(f"{m['message_id']} ({m['invalid_date_columns']})"
+                                  for m in invalid["messages"])
+                raise GateFailure("invalid_dates",
+                                  f"{len(invalid['messages'])} message_id(s) carry a typed date that is not a "
+                                  f"real calendar date; that datetime was left empty: {named}")
     except GateFailure as g:
         result["status"] = "error"
         result["failed_check"] = g.gate
@@ -348,7 +486,8 @@ def health():
 @app.route("/run", methods=["POST"])
 def run():
     body = request.get_json(force=True, silent=True) or {}
-    result = run_refresh(dry_run=bool(body.get("dry_run", False)))
+    result = run_refresh(dry_run=bool(body.get("dry_run", False)),
+                         target_table=body.get("target_table"))
     code = 200 if result["status"] == "ok" else 500
     return app.response_class(json.dumps(result, default=str), status=code,
                               mimetype="application/json")

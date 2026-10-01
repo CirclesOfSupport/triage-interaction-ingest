@@ -19,6 +19,12 @@ Question IDs on the Interaction Log survey (6902806):
 Collapse rule: one row per trid, keeping the LATEST submission (by date_submitted).
 Conclude rule (team decision 2026-06-23): concluded_datetime is null whenever the
 individual did not respond, because counselors historically filled it on no-response.
+
+Invalid dates: a typed date that is not a real calendar date (2/30, 4/31) gives a null
+datetime (normalizer class invalid_date). The row is still written; its staging row keeps
+the counselor's raw text and names the column in invalid_date_columns, and the run reports
+it as an error after the MERGE. A connected answer with an invalid date still means the
+individual responded: connected stays "Yes" with a null connected datetime.
 """
 
 import re
@@ -43,9 +49,12 @@ MERGE_COLUMNS = [
     "triage_interaction_vcl_warm_handoff",
 ]
 
-# Provenance columns: which Alchemer response each row came from. Not read by the MERGE;
-# kept so a changed or surprising row can be traced to its submission.
-SOURCE_COLUMNS = ["source_response_id", "source_date_submitted", "source_status"]
+# Provenance columns: which Alchemer response each row came from, the counselor's raw
+# datetime answers, and which datetimes were not real dates. Not read by the MERGE; kept so
+# a changed or surprising row can be traced to its submission.
+SOURCE_COLUMNS = ["source_response_id", "source_date_submitted", "source_status",
+                  "source_initiated_raw", "source_connected_raw", "source_concluded_raw",
+                  "invalid_date_columns"]
 
 STAGING_COLUMNS = MERGE_COLUMNS + SOURCE_COLUMNS
 
@@ -76,19 +85,29 @@ def resp_date(r):
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
 
 
-def connected_fields(sd, rd):
-    """(connected_flag, connected_datetime). Source = 135 (radio) coalesced with 120 (deprecated)."""
+def connected_source(sd):
+    """The connected answer: 135 (radio), coalesced with 120 (deprecated)."""
     src = ans(sd, "135")
     if src is None or str(src).strip() == "":
         src = ans(sd, "120")
     if src is None or str(src).strip() == "":
-        return (None, None)                      # neither present -> unknown
+        return None
+    return src
+
+
+def connected_fields(sd, rd):
+    """(connected_flag, connected_datetime, class)."""
+    src = connected_source(sd)
+    if src is None:
+        return (None, None, "blank")             # neither present -> unknown
     iso, cls = normalize(src, rd)
     if cls == "non_time":                        # "did not respond to outreach"
-        return ("No", None)
+        return ("No", None, cls)
     if iso:
-        return ("Yes", iso)
-    return (None, None)                          # present but unparseable -> leave blank
+        return ("Yes", iso, cls)
+    if cls == "invalid_date":                    # a date was typed, so they responded
+        return ("Yes", None, cls)
+    return (None, None, cls)                     # present but unparseable -> leave blank
 
 
 def build_staging(responses):
@@ -117,11 +136,15 @@ def build_staging(responses):
     for trid, (sub, r) in latest.items():
         sd = r.get("survey_data", {}) or {}
         rd = resp_date(r)
-        init_iso, _ = normalize(ans(sd, "119"), rd)
-        conn_flag, conn_iso = connected_fields(sd, rd)
-        concl_iso, _ = normalize(ans(sd, "126"), rd)
+        init_iso, init_cls = normalize(ans(sd, "119"), rd)
+        conn_flag, conn_iso, conn_cls = connected_fields(sd, rd)
+        concl_iso, concl_cls = normalize(ans(sd, "126"), rd)
         if conn_flag == "No":
-            concl_iso = None
+            concl_iso, concl_cls = None, "nulled_no_response"
+        invalid = [c for c, cls in (("triage_interaction_initiated_datetime", init_cls),
+                                    ("triage_interaction_connected_datetime", conn_cls),
+                                    ("triage_interaction_concluded_datetime", concl_cls))
+                   if cls == "invalid_date"]
         rows.append({
             "triage_request_id": trid,
             "triage_interaction_type": ans(sd, "136"),
@@ -137,6 +160,10 @@ def build_staging(responses):
             "source_response_id": str(r.get("id")) if r.get("id") is not None else None,
             "source_date_submitted": sub or None,
             "source_status": r.get("status"),
+            "source_initiated_raw": ans(sd, "119"),
+            "source_connected_raw": connected_source(sd),
+            "source_concluded_raw": ans(sd, "126"),
+            "invalid_date_columns": ", ".join(invalid) or None,
         })
 
     conn = Counter(row["triage_interaction_connected"] for row in rows)
@@ -154,5 +181,6 @@ def build_staging(responses):
         "vcl_warm_handoff_null": vcl.get(None, 0),
         "initiated_null": sum(1 for row in rows if not row["triage_interaction_initiated_datetime"]),
         "source_status_counts": dict(Counter(row["source_status"] for row in rows)),
+        "invalid_date_rows": sum(1 for row in rows if row["invalid_date_columns"]),
     }
     return rows, stats
